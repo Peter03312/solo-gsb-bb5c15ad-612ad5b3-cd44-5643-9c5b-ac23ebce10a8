@@ -8,6 +8,7 @@ const diff_1 = require("./diff");
 const validate_1 = require("./validate");
 const supplement_1 = require("./supplement");
 const reline_1 = require("./reline");
+const batchedit_1 = require("./batchedit");
 const restore_1 = require("./restore");
 const util_1 = require("./util");
 const repo_1 = require("./repo");
@@ -450,6 +451,66 @@ exports.router.post('/documents/:id/reline', wrap(async (req, res) => {
         await (0, repo_1.bumpVersion)(c, id); // 整次成功只推进一次
         const after = await (0, repo_1.getDoc)(c, id);
         return { version: after.version, result: built.plan };
+    });
+    res.json({ ok: true, ...result });
+}));
+// ---------- 批量行改（一次校订同一文献多份抄本的多份原始行） ----------
+/**
+ * 批量行改预览（只读，不推进版本）：
+ *   POST /api/documents/:id/lines/batch-edit/preview  { edits: [{ lineId, startCp, endCp, replacement }] }
+ * 返回各行新文字（lines[]）、片段新位置（fragments[]：unchanged/moved/broken）、
+ * 受影响组（brokenGroups[]，区分新标待修复与原已待修复），以及提交须原样带回的 basis
+ * 与当前文献 version。
+ * 非法请求体 / 区间 / 跨文献行 / 区间重叠 / 同点重复插入 / 插入点落入他编辑区间（含端点）
+ * → 400 且 details[] 逐条定位；行不存在 → 404。
+ */
+exports.router.post('/documents/:id/lines/batch-edit/preview', wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const result = await (0, db_1.withTx)(async (c) => {
+        const doc = await (0, repo_1.getDoc)(c, id);
+        const { plan } = await (0, batchedit_1.buildPlanForEdits)(c, doc, req.body?.edits, {
+            forUpdate: false,
+            requireBasis: false,
+        });
+        return {
+            documentId: doc.id,
+            version: doc.version,
+            editCount: plan.lines.reduce((n, l) => n + l.edits.length, 0),
+            ...plan,
+        };
+    });
+    res.json(result);
+}));
+/**
+ * 提交批量行改：
+ *   POST /api/documents/:id/lines/batch-edit
+ *   { expectedVersion, edits: [...], basis }   // basis 原样带回预览响应中的 basis
+ * 版本过期 → 409 整批拒绝且不写入；预览所依据的行已变化（basis 不符）→ 409 BATCH_EDIT_STALE；
+ * 请求体重跑同样的区间 / 冲突 / 跨文献行校验（400 定位）。成功只推进一次版本，
+ * 返回 { ok, version, result }（result 与预览同构）。已发布快照保持原样。
+ */
+exports.router.post('/documents/:id/lines/batch-edit', wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const result = await (0, db_1.withTx)(async (c) => {
+        const doc = await (0, repo_1.lockDoc)(c, id);
+        (0, repo_1.checkVersion)(doc, req.body?.expectedVersion); // 版本过期 → 409，不写入
+        const { plan } = await (0, batchedit_1.buildPlanForEdits)(c, doc, req.body?.edits, {
+            forUpdate: true,
+            requireBasis: true,
+            basis: req.body?.basis,
+        });
+        await (0, batchedit_1.applyBatchEditPlan)(c, plan);
+        await (0, repo_1.bumpVersion)(c, id); // 整批成功只推进一次
+        const after = await (0, repo_1.getDoc)(c, id);
+        return {
+            version: after.version,
+            result: {
+                documentId: id,
+                version: after.version,
+                editCount: plan.lines.reduce((n, l) => n + l.edits.length, 0),
+                ...plan,
+            },
+        };
     });
     res.json({ ok: true, ...result });
 }));

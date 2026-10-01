@@ -95,9 +95,25 @@ export const api = {
       | { op: 'split'; lineId: number; splitCp: number; basis: ReLineBasis }
       | { op: 'merge'; leftLineId: number; rightLineId: number; basis: ReLineBasis }
   ) => req<ReLineResult>('POST', `/api/documents/${id}/reline`, { expectedVersion, ...body }),
+  batchEditPreview: (id: number, edits: BatchEditItem[]) =>
+    req<BatchEditPreview>('POST', `/api/documents/${id}/lines/batch-edit/preview`, { edits }),
+  batchEditCommit: (
+    id: number,
+    expectedVersion: number,
+    edits: BatchEditItem[],
+    basis: unknown
+  ) =>
+    req<BatchEditResult>('POST', `/api/documents/${id}/lines/batch-edit`, {
+      expectedVersion,
+      edits,
+      basis,
+    }),
 };
 
 import type {
+  BatchEditItem,
+  BatchEditPreview,
+  BatchEditResult,
   CollationView,
   DocumentSummary,
   EditionDiff,

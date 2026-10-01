@@ -154,6 +154,66 @@ curl -X POST http://localhost:4000/api/documents/1/supplement \
 `groups[]`（每组 `groupId/ord/baseText/status/adoptable/reason/candidates[]`，
 候选含 `lineId/lineNo/startCp/endCp/text/conflictsWithGroupIds`）。
 
+### 批量行改（一次校订多份抄本的多份原始行）
+校勘人员可一次提交对**同一文献多份抄本多份原始行**的多处改字（工作区「批量改字」页签，
+也可直接调 HTTP API）：输入**文献版本号**（提交时）与**非空编辑列表**，每项给出
+`lineId`、按**改前原文**计算的 Unicode 码点**左闭右开区间** `[startCp,endCp)` 及
+`replacement`（`startCp=endCp` 为插入，`replacement` 为空串即删除）。一律「先预览、再凭文献版本确认」：
+
+- **预览（只读，不推进版本）**：返回**各行新文字**（`lines[]`：改前/改后内容、字数、本行命中编辑）、
+  **片段新位置**（`fragments[]`：`unchanged` 原位 / `moved` 按累计位移平移 / `broken` 待修复）、
+  **受影响组**（`brokenGroups[]`，区分「新标待修复」与「原已待修复」），以及提交时须原样带回的
+  `basis` 与当前文献 `version`。
+- **同一行的编辑按原坐标同时生效**：区间**重叠**（端点相接允许）、**同点重复插入**、
+  插入点落在其他编辑区间**内部及端点**均**整批拒绝**；非法区间、**跨文献行**同样整批报错，
+  `details[]` 逐条给出 `code`（`BAD_SHAPE/BAD_RANGE/LINE_NOT_IN_DOC/OVERLAPPING_RANGES/
+  DUPLICATE_INSERTION/INSERTION_POINT_IN_INTERVAL`）与位置（请求项下标 / 行号 / 行 id / 码点）。
+- **片段规则（与单行改字一致，逐编辑按累计位移重放）**：
+  - 插入点**严格位于片段内部**才令所在组待修复；位于片段**边界**时仅平移后续片段；
+  - 其他改动与片段**相交**、或片段**迁移后越界**（缩行）也令组待修复（坐标保留可追溯）；
+  - 未受影响片段按**累计位移**更新；**原已待修复组与显式缺文状态不得自动改好**
+    （缺文标记不依附行，批量行改永不触及）。
+- **提交**：携带 `expectedVersion` 与预览返回的 `basis`。
+  版本过期 → **409** 整批拒绝且不写入；预览所依据的行已变化（basis 不符）→ **409**
+  `details.code=BATCH_EDIT_STALE`；提交体重跑同一套区间 / 冲突 / 跨文献行校验（400 定位）。
+  **成功只推进一次文献版本**，返回 `{ ok, version, result }`（`result` 与预览同构）；
+  **已发布快照保持原样**。行不存在 → 404；文献不存在 → 404。
+
+接口：
+
+```bash
+# 预览（只读）
+curl -X POST http://localhost:4000/api/documents/1/lines/batch-edit/preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "edits": [
+      { "lineId": 10, "startCp": 0, "endCp": 0, "replacement": "曰" },
+      { "lineId": 10, "startCp": 5, "endCp": 6, "replacement": "性" },
+      { "lineId": 21, "startCp": 3, "endCp": 4, "replacement": "" }
+    ]
+  }'
+
+# 确认整批写入（携带预览响应里的 version 与 basis）
+curl -X POST http://localhost:4000/api/documents/1/lines/batch-edit \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "expectedVersion": 7,
+    "edits": [
+      { "lineId": 10, "startCp": 0, "endCp": 0, "replacement": "曰" },
+      { "lineId": 10, "startCp": 5, "endCp": 6, "replacement": "性" },
+      { "lineId": 21, "startCp": 3, "endCp": 4, "replacement": "" }
+    ],
+    "basis": [
+      { "lineId": 10, "lineNo": 1, "msId": 2, "msName": "乙本", "content": "天命之謂性率性之謂道", "lengthCp": 10 }
+    ]
+  }'
+```
+
+预览返回：`documentId/version/editCount`、`lines[]`（`lineId/lineNo/msId/msName/oldContent/newContent/
+oldLengthCp/newLengthCp/edits[]`）、`fragments[]`（`fragmentId/groupId/groupOrd/groupAlreadyBroken/
+lineId/lineNo/oldStartCp/oldEndCp` 与 `status/newStartCp/newEndCp/note`）、
+`brokenGroups[]`（`groupId/ord/newlyBroken/reason`）、`basis[]`（每个被改行一条）。
+
 ### 行界调整（拆分 / 合并原始行，不改变字序）
 校勘人员可在**不改变字序**的前提下调整一份抄本的原始行界：按 Unicode 码点在**行内拆分**，
 或**合并相邻两行**。一律「先预览、再凭文献版本确认」：
@@ -313,6 +373,8 @@ curl -X POST http://localhost:4000/api/documents/1/editions/1/restore \
 | PUT | `/api/documents/:id/base` | 选定底本 |
 | POST | `/api/manuscripts/:msId/lines` | 追加一行 |
 | PUT | `/api/lines/:lineId` | 行内改字（`startCp/endCp/replacement`） |
+| POST | `/api/documents/:id/lines/batch-edit/preview` | **批量行改预览**（只读）：多抄本多行多处编辑，返回各行新文字/片段新位置/受影响组 |
+| POST | `/api/documents/:id/lines/batch-edit` | **确认批量行改**（携带 `basis`；区间重叠/同点插入/插入点落他区间含端点/跨文献行 400 定位；过期 409、basis 不符 409 `BATCH_EDIT_STALE`，成功只推进一次） |
 | PUT | `/api/documents/:id/groups` | 整批保存对应组（替换式，全量校验） |
 | PUT | `/api/documents/:id/groups/:gid/repair` | 修复单个对应组 |
 | DELETE | `/api/documents/:id/groups/:gid` | 删除对应组 |
@@ -359,7 +421,14 @@ npm test
 标题与已发布版编号及全部快照不变、重建行与组取得新 id 而抄本沿用稳定身份、
 恢复后与该版对照完全一致、恢复后改字/修复/行界/补配/对照/再发布/新增抄本全流程可用、
 成功版本号只前进一次、缺 expectedVersion 400、版本已变化 409 不改动、目标版不存在 404、
-损坏快照（片段越界）409 RESTORE_SNAPSHOT_INVALID 逐条说明且整体拒绝不推进版本**。
+损坏快照（片段越界）409 RESTORE_SNAPSHOT_INVALID 逐条说明且整体拒绝不推进版本**，以及
+**批量行改：同一行多个不相交编辑按原坐标同时生效、跨抄本累计位移、端点相接只平移不待修复、
+插入点严格位于片段内部才待修复（边界只平移）、相交/缩行越界保留可追溯坐标并标组待修复、
+原已待修复组与缺文不自动改好、预览只读不推进、区间重叠/同点重复插入/插入点落他区间内部及端点/
+非法区间/跨文献行整批报错定位（BAD_RANGE/OVERLAPPING_RANGES/DUPLICATE_INSERTION/
+INSERTION_POINT_IN_INTERVAL/LINE_NOT_IN_DOC/BAD_SHAPE）、非零长编辑端点相接允许、
+行或文献不存在 404、缺 basis 400、过期版本 409 与 basis 不符 409（BATCH_EDIT_STALE）皆整批拒绝不写入不推进、
+成功只推进一次版本、已发布快照保持原样、扩展 B 区生僻字按码点替换**。
 
 ---
 

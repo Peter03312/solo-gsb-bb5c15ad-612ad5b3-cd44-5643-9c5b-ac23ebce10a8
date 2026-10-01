@@ -173,6 +173,83 @@ export interface ReLinePreview extends ReLinePlan {
   version: number;
 }
 
+// ---- 批量行改（一次校订同一文献多份抄本的多份原始行；先预览、再凭版本确认）----
+
+export interface BatchEditDTO {
+  lineId: number;
+  startCp: number;              // Unicode 码点偏移（左闭，按改前原文计算）
+  endCp: number;                // 右开；startCp=endCp 为插入点
+  replacement: string;          // 替换文字（空串=删除）
+}
+
+/** 预览所依据的行状态（每个被改行一条）：提交时须原样带回。 */
+export interface BatchEditLineBasis {
+  lineId: number;
+  lineNo: number;
+  msId: number;
+  msName: string;
+  content: string;
+  lengthCp: number;
+}
+
+export interface BatchEditLinePlan {
+  lineId: number;
+  lineNo: number;
+  msId: number;
+  msName: string;
+  oldContent: string;
+  newContent: string;
+  oldLengthCp: number;
+  newLengthCp: number;
+  /** 本行命中的编辑（按原坐标排序，index 为请求列表中的下标）。 */
+  edits: Array<{
+    index: number;
+    startCp: number;
+    endCp: number;
+    replacement: string;
+    replacementLengthCp: number;
+  }>;
+}
+
+export type BatchEditFragmentStatus = 'unchanged' | 'moved' | 'broken';
+
+export interface BatchEditFragmentPlan {
+  fragmentId: number;
+  groupId: number;
+  groupOrd: number;
+  groupAlreadyBroken: boolean;
+  msId: number;
+  lineId: number;
+  lineNo: number;
+  oldStartCp: number;
+  oldEndCp: number;
+  status: BatchEditFragmentStatus;
+  /** 相交改动保留原区间坐标以便追溯（与现行单行改字一致），故此时与旧坐标相同。 */
+  newStartCp: number | null;
+  newEndCp: number | null;
+  note: string;
+}
+
+export interface BatchEditBrokenGroup {
+  groupId: number;
+  ord: number;
+  newlyBroken: boolean;         // false=原已待修复（批量改字不得自动转好）
+  reason: string;
+}
+
+export interface BatchEditPlan {
+  basis: BatchEditLineBasis[];
+  lines: BatchEditLinePlan[];
+  fragments: BatchEditFragmentPlan[];
+  brokenGroups: BatchEditBrokenGroup[];
+}
+
+export interface BatchEditPreview extends BatchEditPlan {
+  documentId: number;
+  version: number;
+  editCount: number;
+}
+
 // ---- 对外（API / 前端）类型 ----
 
 export interface FragmentDTO {

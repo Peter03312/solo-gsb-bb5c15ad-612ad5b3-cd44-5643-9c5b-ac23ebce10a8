@@ -1464,6 +1464,390 @@ async function main() {
     assert.strictEqual(cView.document.version, cVerNow, '损坏快照拒绝后不得推进版本');
     assert.strictEqual(cView.stats.lineCount, cLinesBefore, '损坏快照拒绝后不得改动数据');
 
+    // ========== 批量行改：一次校订同一文献多份抄本的多份原始行 ==========
+    r = await call(base, 'POST', '/documents', { title: `批量行改测试 ${++seq}`, manuscripts: ['甲', '乙', '丙'] });
+    assert.strictEqual(r.status, 201, JSON.stringify(r.json));
+    const dBE = r.json.id;
+    let beView = (await call(base, 'GET', `/documents/${dBE}`)).json;
+    const [beA, beB, beC] = beView.manuscripts;
+    // 甲：行1 0123456789 / 行2 ABCDE
+    // 乙：行1 0123456789 / 行2 ABCDE（组2 对乙显式缺文）
+    // 丙：行1 0123456789 / 行2 ABCDE
+    let beV = beView.document.version;
+    for (const [ms, text] of [
+      [beA.id, '0123456789'], [beB.id, '0123456789'], [beC.id, '0123456789'],
+      [beA.id, 'ABCDE'], [beB.id, 'ABCDE'], [beC.id, 'ABCDE'],
+    ] as Array<[number, string]>) {
+      r = await call(base, 'POST', `/manuscripts/${ms}/lines`, { expectedVersion: beV, content: text });
+      assert.strictEqual(r.status, 201, JSON.stringify(r.json));
+      beV++;
+    }
+    beView = (await call(base, 'GET', `/documents/${dBE}`)).json;
+    const beLine = (msId: number, no: number) =>
+      beView.rawByMs.find((x: any) => x.msId === msId).lines[no - 1].lineId;
+    const beA1 = beLine(beA.id, 1), beA2 = beLine(beA.id, 2);
+    const beB1 = beLine(beB.id, 1), beB2 = beLine(beB.id, 2);
+    const beC1 = beLine(beC.id, 1), beC2 = beLine(beC.id, 2);
+    // 组1：三抄本行1 [0,3)；组2：甲 [3,6)、乙缺文、丙 [3,6)；组3：三抄本行2 [1,4)
+    r = await call(base, 'PUT', `/documents/${dBE}/groups`, {
+      expectedVersion: beView.document.version,
+      groups: [
+        { ord: 1, fragments: [
+          { msId: beA.id, lineId: beA1, startCp: 0, endCp: 3 },
+          { msId: beB.id, lineId: beB1, startCp: 0, endCp: 3 },
+          { msId: beC.id, lineId: beC1, startCp: 0, endCp: 3 },
+        ]},
+        { ord: 2, fragments: [
+          { msId: beA.id, lineId: beA1, startCp: 3, endCp: 6 },
+          { msId: beB.id, missing: true },
+          { msId: beC.id, lineId: beC1, startCp: 3, endCp: 6 },
+        ]},
+        { ord: 3, fragments: [
+          { msId: beA.id, lineId: beA2, startCp: 1, endCp: 4 },
+          { msId: beB.id, lineId: beB2, startCp: 1, endCp: 4 },
+          { msId: beC.id, lineId: beC2, startCp: 1, endCp: 4 },
+        ]},
+      ],
+    });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    beView = (await call(base, 'GET', `/documents/${dBE}`)).json;
+    const beVerAfterGroups = beView.document.version;
+
+    // ---- 预览：同一行多个不相交编辑按原坐标同时生效 + 跨抄本累计位移，无待修复 ----
+    // 甲行1「0123456789」：在点 0 与点 3 各插入一个字（均为原坐标）
+    //   组1 [0,3)：点0 在其起点（边界，片段在其后→平移）；点3 在其终点（边界，不后续）⇒ [1,4)
+    //   组2 [3,6)：两个点都位于其起点或之前（边界只平移后续片段）→ 累计 +2 ⇒ [5,8)
+    // 丙行1：[6,7) 删除（长度-1）：组2 [3,6) 与删除区间端点相接 → 不动
+    // 乙行2：[4,4) 插入「Q」：组3 [1,4) 的插入点在其右端点（边界）→ 不平移
+    let bep = (await call(base, 'POST', `/documents/${dBE}/lines/batch-edit/preview`, {
+      edits: [
+        { lineId: beA1, startCp: 0, endCp: 0, replacement: 'X' },
+        { lineId: beA1, startCp: 3, endCp: 3, replacement: 'W' },
+        { lineId: beC1, startCp: 6, endCp: 7, replacement: '' },
+        { lineId: beB2, startCp: 4, endCp: 4, replacement: 'Q' },
+      ],
+    })).json;
+    assert.strictEqual(bep.documentId, dBE);
+    assert.strictEqual(bep.version, beVerAfterGroups, '预览只读，不推进版本');
+    assert.strictEqual(bep.editCount, 4);
+    assert.strictEqual(bep.lines.length, 3);
+    const prevA1 = bep.lines.find((l: any) => l.lineId === beA1);
+    assert.strictEqual(prevA1.oldContent, '0123456789');
+    assert.strictEqual(prevA1.newContent, 'X012W3456789', `按原坐标同时生效，实际：${prevA1.newContent}`);
+    assert.strictEqual(prevA1.newLengthCp, 12);
+    const prevC1 = bep.lines.find((l: any) => l.lineId === beC1);
+    assert.strictEqual(prevC1.newContent, '012345789');
+    const prevB2 = bep.lines.find((l: any) => l.lineId === beB2);
+    assert.strictEqual(prevB2.newContent, 'ABCDQE');
+    assert.strictEqual(bep.brokenGroups.length, 0, '全部为端点相接 / 不相交平移，无待修复组');
+    const fA1g1 = bep.fragments.find((f: any) => f.lineId === beA1 && f.groupOrd === 1);
+    assert.strictEqual(fA1g1.status, 'moved');
+    assert.deepStrictEqual([fA1g1.newStartCp, fA1g1.newEndCp], [1, 4]);
+    const fA1g2 = bep.fragments.find((f: any) => f.lineId === beA1 && f.groupOrd === 2);
+    assert.deepStrictEqual([fA1g2.newStartCp, fA1g2.newEndCp], [5, 8], '两个插入点都在片段起点/之前，累计位移 +2');
+    const fC1g2 = bep.fragments.find((f: any) => f.lineId === beC1 && f.groupOrd === 2);
+    assert.strictEqual(fC1g2.status, 'unchanged', '删除点 6 与片段右端点相接，不平移');
+    const fB2g3 = bep.fragments.find((f: any) => f.lineId === beB2 && f.groupOrd === 3);
+    assert.strictEqual(fB2g3.status, 'unchanged', '插入点位于片段边界（右端点），不平移该片段');
+    assert.ok(Array.isArray(bep.basis) && bep.basis.length === 3);
+
+    // 再次查看确认预览只读
+    beView = (await call(base, 'GET', `/documents/${dBE}`)).json;
+    assert.strictEqual(beView.document.version, beVerAfterGroups);
+
+    // ---- 提交：携带 expectedVersion + basis；成功只推进一次版本 ----
+    r = await call(base, 'POST', `/documents/${dBE}/lines/batch-edit`, {
+      expectedVersion: beVerAfterGroups,
+      edits: [
+        { lineId: beA1, startCp: 0, endCp: 0, replacement: 'X' },
+        { lineId: beA1, startCp: 3, endCp: 3, replacement: 'W' },
+        { lineId: beC1, startCp: 6, endCp: 7, replacement: '' },
+        { lineId: beB2, startCp: 4, endCp: 4, replacement: 'Q' },
+      ],
+      basis: bep.basis,
+    });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    assert.strictEqual(r.json.version, beVerAfterGroups + 1, '成功只推进一次版本');
+    assert.strictEqual(r.json.result.lines.find((l: any) => l.lineId === beA1).newContent, 'X012W3456789');
+    beView = (await call(base, 'GET', `/documents/${dBE}`)).json;
+    assert.strictEqual(beView.stats.brokenCount, 0);
+    const afterA1g1 = beView.groups.find((g: any) => g.ord === 1).cells.find((c: any) => c.msId === beA.id);
+    assert.strictEqual(afterA1g1.text, '012', '平移后截取文字不变');
+    const afterA1g2 = beView.groups.find((g: any) => g.ord === 2).cells.find((c: any) => c.msId === beA.id);
+    assert.strictEqual(afterA1g2.text, '345', '累计位移后 [5,8) 仍截取原片段文字 345');
+    // 组2 乙仍显式缺文，缺文状态不被改动
+    const afterG2B = beView.groups.find((g: any) => g.ord === 2).cells.find((c: any) => c.msId === beB.id);
+    assert.strictEqual(afterG2B.missing, true, '缺文标记不依附行，批量行改不得改动缺文');
+
+    // ---- 插入点严格位于片段内部 → 组待修复（边界只平移）----
+    beView = (await call(base, 'GET', `/documents/${dBE}`)).json;
+    const vForInsert = beView.document.version;
+    // 当前乙行1 仍为 0123456789；组1 乙片段 [0,3)。在点 1（严格内部）插「中」→ 组1 待修复
+    bep = (await call(base, 'POST', `/documents/${dBE}/lines/batch-edit/preview`, {
+      edits: [{ lineId: beB1, startCp: 1, endCp: 1, replacement: '中' }],
+    })).json;
+    assert.strictEqual(bep.brokenGroups.length, 1);
+    assert.strictEqual(bep.brokenGroups[0].groupId, beView.groups.find((g: any) => g.ord === 1).id);
+    assert.strictEqual(bep.brokenGroups[0].newlyBroken, true);
+    const bf = bep.fragments.find((f: any) => f.lineId === beB1 && f.groupOrd === 1);
+    assert.strictEqual(bf.status, 'broken');
+    assert.deepStrictEqual([bf.newStartCp, bf.newEndCp], [0, 3], '相交片段保留原区间坐标可追溯');
+    r = await call(base, 'POST', `/documents/${dBE}/lines/batch-edit`, {
+      expectedVersion: vForInsert,
+      edits: [{ lineId: beB1, startCp: 1, endCp: 1, replacement: '中' }],
+      basis: bep.basis,
+    });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    beView = (await call(base, 'GET', `/documents/${dBE}`)).json;
+    assert.strictEqual(beView.stats.brokenCount, 1);
+    // 待修复期间不得发布
+    r = await call(base, 'POST', `/documents/${dBE}/publish`, { expectedVersion: beView.document.version });
+    await expectFail(r, 409, '待修复');
+
+    // ---- 原已待修复组不得自动改好：对乙行1做不相交的平移编辑，组1 仍待修复 ----
+    // 乙行1 现在「0中123456789」（11 字）；组1 [0,3) 保留原坐标（覆盖 0中1）。
+    // 在点 11（行尾）插入不与片段相交 → 组1 在 brokenGroups 中但 newlyBroken=false
+    bep = (await call(base, 'POST', `/documents/${dBE}/lines/batch-edit/preview`, {
+      edits: [{ lineId: beB1, startCp: 11, endCp: 11, replacement: '尾' }],
+    })).json;
+    const stillBroken = bep.brokenGroups.find((g: any) => g.ord === 1);
+    assert.ok(stillBroken, '原已待修复组仍须列出');
+    assert.strictEqual(stillBroken.newlyBroken, false, '原已待修复不得自动转好');
+    const stillFrag = bep.fragments.find((f: any) => f.lineId === beB1 && f.groupOrd === 1);
+    assert.strictEqual(stillFrag.groupAlreadyBroken, true, '片段仍标记为原组已待修复');
+    assert.ok(stillFrag.status === 'broken' || stillFrag.status === 'unchanged', '片段坐标保留 / 不动');
+
+    // ---- 缩行致片段越界 → 组待修复（相交改动保留原坐标，读模型中呈越界）----
+    // 先修复组1，便于干净验证越界路径
+    beView = (await call(base, 'GET', `/documents/${dBE}`)).json;
+    const g1Id = beView.groups.find((g: any) => g.ord === 1).id;
+    r = await call(base, 'PUT', `/documents/${dBE}/groups/${g1Id}/repair`, {
+      expectedVersion: beView.document.version,
+      group: { ord: 1, fragments: [
+        { msId: beA.id, lineId: beA1, startCp: 1, endCp: 4 },
+        { msId: beB.id, lineId: beB1, startCp: 0, endCp: 3 },
+        { msId: beC.id, lineId: beC1, startCp: 0, endCp: 3 },
+      ]},
+    });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    beView = (await call(base, 'GET', `/documents/${dBE}`)).json;
+    assert.strictEqual(beView.stats.brokenCount, 0);
+    // 丙行2 仍为 ABCDE，组3 丙片段 [1,4)=BCD；删除 [2,5) 与片段相交且缩短行 → 组3 待修复，
+    // 原区间 [1,4) 保留（右端越出新行长 2）以便追溯。
+    bep = (await call(base, 'POST', `/documents/${dBE}/lines/batch-edit/preview`, {
+      edits: [{ lineId: beC2, startCp: 2, endCp: 5, replacement: '' }],
+    })).json;
+    assert.strictEqual(bep.lines.find((l: any) => l.lineId === beC2).newContent, 'AB');
+    const oob = bep.fragments.find((f: any) => f.lineId === beC2 && f.groupOrd === 3);
+    assert.strictEqual(oob.status, 'broken');
+    assert.deepStrictEqual([oob.newStartCp, oob.newEndCp], [1, 4], '相交改动保留原区间坐标');
+    assert.strictEqual(bep.brokenGroups.find((g: any) => g.ord === 3).newlyBroken, true);
+
+    // ---- 冲突 / 非法编辑整批报错并定位 ----
+    // 区间重叠
+    r = await call(base, 'POST', `/documents/${dBE}/lines/batch-edit/preview`, {
+      edits: [
+        { lineId: beA2, startCp: 0, endCp: 3, replacement: 'xxx' },
+        { lineId: beA2, startCp: 2, endCp: 4, replacement: 'yy' },
+      ],
+    });
+    await expectFail(r, 400, '重叠');
+    assert.ok(r.json.details.some((d: any) => d.code === 'OVERLAPPING_RANGES' && d.lineId === beA2));
+    // 同点重复插入
+    r = await call(base, 'POST', `/documents/${dBE}/lines/batch-edit/preview`, {
+      edits: [
+        { lineId: beA2, startCp: 1, endCp: 1, replacement: '甲' },
+        { lineId: beA2, startCp: 1, endCp: 1, replacement: '乙' },
+      ],
+    });
+    await expectFail(r, 400, '重复插入');
+    assert.ok(r.json.details.some((d: any) => d.code === 'DUPLICATE_INSERTION'));
+    // 插入点落在其他编辑区间内部
+    r = await call(base, 'POST', `/documents/${dBE}/lines/batch-edit/preview`, {
+      edits: [
+        { lineId: beA2, startCp: 0, endCp: 3, replacement: 'xyz' },
+        { lineId: beA2, startCp: 2, endCp: 2, replacement: '内' },
+      ],
+    });
+    await expectFail(r, 400, '插入点');
+    assert.ok(r.json.details.some((d: any) => d.code === 'INSERTION_POINT_IN_INTERVAL'));
+    // 插入点落在其他编辑区间端点（同样拒绝）
+    r = await call(base, 'POST', `/documents/${dBE}/lines/batch-edit/preview`, {
+      edits: [
+        { lineId: beA2, startCp: 0, endCp: 3, replacement: 'xyz' },
+        { lineId: beA2, startCp: 3, endCp: 3, replacement: '端' },
+      ],
+    });
+    await expectFail(r, 400, '端点');
+    assert.ok(r.json.details.some((d: any) => d.code === 'INSERTION_POINT_IN_INTERVAL'));
+    // 非零长编辑端点相接允许（[0,3) 与 [3,5)）
+    r = await call(base, 'POST', `/documents/${dBE}/lines/batch-edit/preview`, {
+      edits: [
+        { lineId: beA2, startCp: 0, endCp: 3, replacement: 'XYZ' },
+        { lineId: beA2, startCp: 3, endCp: 5, replacement: 'DE' },
+      ],
+    });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    assert.strictEqual(r.json.lines[0].newContent, 'XYZDE');
+    // 非法区间（越界）
+    r = await call(base, 'POST', `/documents/${dBE}/lines/batch-edit/preview`, {
+      edits: [{ lineId: beA2, startCp: 0, endCp: 99, replacement: '' }],
+    });
+    await expectFail(r, 400, '越界');
+    assert.ok(r.json.details.some((d: any) => d.code === 'BAD_RANGE'));
+    // 非法请求体
+    await expectFail(await call(base, 'POST', `/documents/${dBE}/lines/batch-edit/preview`, {}), 400, 'edits');
+    await expectFail(
+      await call(base, 'POST', `/documents/${dBE}/lines/batch-edit/preview`, { edits: [] }),
+      400,
+      '非空数组'
+    );
+    r = await call(base, 'POST', `/documents/${dBE}/lines/batch-edit/preview`, {
+      edits: [{ lineId: beA2, startCp: 3, endCp: 2, replacement: '' }],
+    });
+    await expectFail(r, 400, '区间非法');
+    assert.ok(r.json.details.some((d: any) => d.code === 'BAD_SHAPE'));
+    r = await call(base, 'POST', `/documents/${dBE}/lines/batch-edit/preview`, {
+      edits: [{ lineId: beA2, startCp: 0, endCp: 1, replacement: 123 }],
+    });
+    await expectFail(r, 400, 'replacement');
+    // 行不存在 → 404
+    await expectFail(
+      await call(base, 'POST', `/documents/${dBE}/lines/batch-edit/preview`, {
+        edits: [{ lineId: 999999, startCp: 0, endCp: 1, replacement: 'x' }],
+      }),
+      404,
+      '不存在'
+    );
+    // 跨文献行 → 400 定位（用恢复测试文献的行 ca1）
+    r = await call(base, 'POST', `/documents/${dBE}/lines/batch-edit/preview`, {
+      edits: [
+        { lineId: beA2, startCp: 0, endCp: 1, replacement: '本' },
+        { lineId: ca1, startCp: 0, endCp: 1, replacement: '他' },
+      ],
+    });
+    await expectFail(r, 400, '不属于文献');
+    assert.ok(r.json.details.some((d: any) => d.code === 'LINE_NOT_IN_DOC' && d.lineId === ca1));
+    // 文献不存在 → 404
+    await expectFail(
+      await call(base, 'POST', `/documents/999999/lines/batch-edit/preview`, {
+        edits: [{ lineId: beA2, startCp: 0, endCp: 1, replacement: 'x' }],
+      }),
+      404,
+      '不存在'
+    );
+    // 任何预览 / 失败提交均不推进版本
+    beView = (await call(base, 'GET', `/documents/${dBE}`)).json;
+    // （前面唯一一次成功提交推进了 1；修复组1又推进 1）
+
+    // ---- 提交：缺 basis 400、版本过期 409、basis 不符 409 BATCH_EDIT_STALE，皆不写入不推进 ----
+    const beCur = beView.document.version;
+    const curA2 = beView.rawByMs.find((x: any) => x.msId === beA.id).lines[1].content;
+    await expectFail(
+      await call(base, 'POST', `/documents/${dBE}/lines/batch-edit`, {
+        expectedVersion: beCur,
+        edits: [{ lineId: beA2, startCp: 0, endCp: 1, replacement: '改' }],
+      }),
+      400,
+      'basis'
+    );
+    // 版本过期
+    bep = (await call(base, 'POST', `/documents/${dBE}/lines/batch-edit/preview`, {
+      edits: [{ lineId: beA2, startCp: 0, endCp: 1, replacement: '改' }],
+    })).json;
+    await expectFail(
+      await call(base, 'POST', `/documents/${dBE}/lines/batch-edit`, {
+        expectedVersion: beCur - 1,
+        edits: [{ lineId: beA2, startCp: 0, endCp: 1, replacement: '改' }],
+        basis: bep.basis,
+      }),
+      409,
+      '版本已过期'
+    );
+    // basis 张冠李戴（内容不符）→ 409 BATCH_EDIT_STALE
+    const tamperedBasis = bep.basis.map((b: any) =>
+      b.lineId === beA2 ? { ...b, content: b.content + '被改动' } : b
+    );
+    await expectFail(
+      await call(base, 'POST', `/documents/${dBE}/lines/batch-edit`, {
+        expectedVersion: beCur,
+        edits: [{ lineId: beA2, startCp: 0, endCp: 1, replacement: '改' }],
+        basis: tamperedBasis,
+      }),
+      409,
+      '预览所依据的行已变化'
+    );
+    // basis 行集合不一致（缺一条）→ 409
+    await expectFail(
+      await call(base, 'POST', `/documents/${dBE}/lines/batch-edit`, {
+        expectedVersion: beCur,
+        edits: [
+          { lineId: beA2, startCp: 0, endCp: 1, replacement: '改' },
+          { lineId: beC2, startCp: 0, endCp: 1, replacement: '动' },
+        ],
+        basis: bep.basis,
+      }),
+      409,
+      '预览所依据的行已变化'
+    );
+    // 拒绝后数据不变、版本不推进
+    beView = (await call(base, 'GET', `/documents/${dBE}`)).json;
+    assert.strictEqual(beView.document.version, beCur, '拒绝不得推进版本');
+    assert.strictEqual(
+      beView.rawByMs.find((x: any) => x.msId === beA.id).lines[1].content,
+      curA2,
+      '拒绝不得写入'
+    );
+
+    // ---- 成功提交后旧发布快照保持原样 ----
+    // 先把所有组修复到完好并发布第 1 版
+    beView = (await call(base, 'GET', `/documents/${dBE}`)).json;
+    if (beView.stats.brokenCount > 0) {
+      // 丙行2 已在预览中计划过越界但未提交；这里确保工作版无待修复（预览不写库，brokenCount 应仍为修复后的 0）
+      assert.strictEqual(beView.stats.brokenCount, 0);
+    }
+    r = await call(base, 'POST', `/documents/${dBE}/publish`, { expectedVersion: beView.document.version });
+    assert.strictEqual(r.status, 201, JSON.stringify(r.json));
+    const beEditionNo = r.json.editionNo;
+    const snapBefore = (await call(base, 'GET', `/documents/${dBE}/editions/${beEditionNo}`)).json;
+    const snapA1 = snapBefore.view.rawByMs.find((x: any) => x.msId === beA.id).lines[0].content;
+    beView = (await call(base, 'GET', `/documents/${dBE}`)).json;
+    const vBeforeFinalEdit = beView.document.version;
+    r = await call(base, 'POST', `/documents/${dBE}/lines/batch-edit`, {
+      expectedVersion: vBeforeFinalEdit,
+      edits: [{ lineId: beA2, startCp: 0, endCp: 1, replacement: '@' }],
+      basis: [
+        {
+          lineId: beA2,
+          lineNo: 2,
+          msId: beA.id,
+          msName: '甲',
+          content: beView.rawByMs.find((x: any) => x.msId === beA.id).lines[1].content,
+          lengthCp: 5,
+        },
+      ],
+    });
+    assert.strictEqual(r.status, 200, JSON.stringify(r.json));
+    const snapAfter = (await call(base, 'GET', `/documents/${dBE}/editions/${beEditionNo}`)).json;
+    assert.strictEqual(
+      snapAfter.view.rawByMs.find((x: any) => x.msId === beA.id).lines[0].content,
+      snapA1,
+      '已发布快照保持原样'
+    );
+
+    // ---- 扩展 B 区生僻字按 Unicode 码点计 ----
+    beView = (await call(base, 'GET', `/documents/${dBE}`)).json;
+    const vForAstral = beView.document.version;
+    r = await call(base, 'POST', `/manuscripts/${beC.id}/lines`, { expectedVersion: vForAstral, content: '𫬺𰻞AB' });
+    assert.strictEqual(r.status, 201);
+    beView = (await call(base, 'GET', `/documents/${dBE}`)).json;
+    const beC3 = beView.rawByMs.find((x: any) => x.msId === beC.id).lines[2].lineId;
+    bep = (await call(base, 'POST', `/documents/${dBE}/lines/batch-edit/preview`, {
+      edits: [{ lineId: beC3, startCp: 2, endCp: 3, replacement: '𠀀' }],
+    })).json;
+    assert.strictEqual(bep.lines.find((l: any) => l.lineId === beC3).newContent, '𫬺𰻞𠀀B', '按码点替换第 3 个字（代理对安全）');
+    assert.strictEqual(bep.lines.find((l: any) => l.lineId === beC3).oldLengthCp, 4);
+
     console.log('✅ 全部集成测试通过');
   } finally {
     await close();

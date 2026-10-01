@@ -322,6 +322,84 @@ export interface ReLineResult {
   result: ReLinePlan;
 }
 
+// ---- 批量行改（一次校订多份抄本的多份原始行）----
+
+export interface BatchEditItem {
+  lineId: number;
+  startCp: number;
+  endCp: number;
+  replacement: string;
+}
+
+export interface BatchEditLineBasis {
+  lineId: number;
+  lineNo: number;
+  msId: number;
+  msName: string;
+  content: string;
+  lengthCp: number;
+}
+
+export interface BatchEditLinePlan {
+  lineId: number;
+  lineNo: number;
+  msId: number;
+  msName: string;
+  oldContent: string;
+  newContent: string;
+  oldLengthCp: number;
+  newLengthCp: number;
+  edits: Array<{
+    index: number;
+    startCp: number;
+    endCp: number;
+    replacement: string;
+    replacementLengthCp: number;
+  }>;
+}
+
+export interface BatchEditFragmentPlan {
+  fragmentId: number;
+  groupId: number;
+  groupOrd: number;
+  groupAlreadyBroken: boolean;
+  msId: number;
+  lineId: number;
+  lineNo: number;
+  oldStartCp: number;
+  oldEndCp: number;
+  status: 'unchanged' | 'moved' | 'broken';
+  newStartCp: number | null;
+  newEndCp: number | null;
+  note: string;
+}
+
+export interface BatchEditBrokenGroup {
+  groupId: number;
+  ord: number;
+  newlyBroken: boolean;
+  reason: string;
+}
+
+export interface BatchEditPlan {
+  basis: BatchEditLineBasis[];
+  lines: BatchEditLinePlan[];
+  fragments: BatchEditFragmentPlan[];
+  brokenGroups: BatchEditBrokenGroup[];
+}
+
+export interface BatchEditPreview extends BatchEditPlan {
+  documentId: number;
+  version: number;
+  editCount: number;
+}
+
+export interface BatchEditResult {
+  ok: boolean;
+  version: number;
+  result: BatchEditPreview;
+}
+
 // ---- 恢复已发布校勘版 ----
 
 export interface RestoreResult {

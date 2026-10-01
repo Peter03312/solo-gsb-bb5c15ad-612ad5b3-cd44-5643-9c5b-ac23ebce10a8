@@ -4,11 +4,12 @@ import type { CollationView } from '../types';
 import { TranscribeTab } from './TranscribeTab';
 import { GroupTab } from './GroupTab';
 import { SupplementTab } from './SupplementTab';
+import { BatchEditTab } from './BatchEditTab';
 import { CollationPage } from './CollationPage';
 import { PublishTab } from './PublishTab';
 import { ErrorBox } from '../ErrorBox';
 
-type Tab = 'transcribe' | 'group' | 'supplement' | 'collation' | 'publish';
+type Tab = 'transcribe' | 'group' | 'supplement' | 'batchedit' | 'collation' | 'publish';
 
 export function Workspace({
   docId,
@@ -97,6 +98,9 @@ export function Workspace({
           <button className={tab === 'supplement' ? 'active' : ''} onClick={() => setTab('supplement')}>
             补配
           </button>
+          <button className={tab === 'batchedit' ? 'active' : ''} onClick={() => setTab('batchedit')}>
+            批量改字
+          </button>
           <button className={tab === 'collation' ? 'active' : ''} onClick={() => setTab('collation')}>
             校勘对照
           </button>
@@ -113,6 +117,9 @@ export function Workspace({
         )}
         {tab === 'supplement' && (
           <SupplementTab view={view} version={version} reload={reload} onError={raise} onNotice={flash} />
+        )}
+        {tab === 'batchedit' && (
+          <BatchEditTab view={view} version={version} reload={reload} onError={raise} onNotice={flash} />
         )}
         {tab === 'collation' && <CollationPage view={view} />}
         {tab === 'publish' && (
