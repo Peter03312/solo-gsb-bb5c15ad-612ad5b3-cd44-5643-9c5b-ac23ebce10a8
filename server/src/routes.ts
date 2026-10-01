@@ -10,6 +10,11 @@ import {
 } from './supplement';
 import { applyReLinePlan, buildReLinePlan } from './reline';
 import { applyRestore, buildRestorePlan } from './restore';
+import {
+  applyBatchEditPlan,
+  buildBatchEditPlan,
+  verifyBasisCurrent,
+} from './batch-edit';
 import { charLen, HttpError, isInt, sliceCp } from './util';
 import {
   bumpVersion,
@@ -19,7 +24,7 @@ import {
   loadMss,
   lockDoc,
 } from './repo';
-import { FragmentDTO, GroupDTO, SupplementSelectionDTO } from './types';
+import { BatchEditDTO, FragmentDTO, GroupDTO, SupplementSelectionDTO } from './types';
 
 export const router = Router();
 
@@ -248,6 +253,104 @@ router.put(
       await bumpVersion(c, doc.id);
     });
     res.json({ ok: true });
+  })
+);
+
+// ---------- 批量改字（一次校订同一文献多份抄本的多条原始行） ----------
+
+/**
+ * 解析批量编辑请求体的形状（不含内容相关校验）：
+ * 需要非空 edits[]，每项含整数 lineId/startCp/endCp 与字符串 replacement，
+ * 且 0 ≤ startCp ≤ endCp。任何形状问题 → 400 逐条（含数组下标）定位。
+ */
+function parseBatchEdits(body: unknown): BatchEditDTO[] {
+  const raw = (body as { edits?: unknown } | null | undefined)?.edits;
+  if (!Array.isArray(raw) || raw.length === 0) {
+    throw new HttpError(400, '需要非空 edits 数组（每项含 lineId/startCp/endCp/replacement）');
+  }
+  const issues: unknown[] = [];
+  const edits: BatchEditDTO[] = [];
+  raw.forEach((e, i) => {
+    if (
+      !e || typeof e !== 'object' ||
+      !isInt((e as { lineId?: unknown }).lineId) ||
+      !isInt((e as { startCp?: unknown }).startCp) ||
+      !isInt((e as { endCp?: unknown }).endCp) ||
+      typeof (e as { replacement?: unknown }).replacement !== 'string'
+    ) {
+      issues.push({ index: i, message: `第 ${i + 1} 项需含整数 lineId/startCp/endCp 与字符串 replacement` });
+      return;
+    }
+    const x = e as { lineId: number; startCp: number; endCp: number; replacement: string };
+    if (x.lineId <= 0) {
+      issues.push({ index: i, message: `第 ${i + 1} 项 lineId 必须是正整数` });
+      return;
+    }
+    if (x.startCp < 0 || x.endCp < x.startCp) {
+      issues.push({
+        index: i,
+        lineId: x.lineId,
+        startCp: x.startCp,
+        endCp: x.endCp,
+        message:
+          `第 ${i + 1} 项区间非法：[${x.startCp}, ${x.endCp})` +
+          '（按 Unicode 码点左闭右开，需 0 ≤ startCp ≤ endCp；startCp=endCp 为纯插入）',
+      });
+      return;
+    }
+    edits.push({ lineId: x.lineId, startCp: x.startCp, endCp: x.endCp, replacement: x.replacement });
+  });
+  if (issues.length > 0) {
+    throw new HttpError(400, `批量校订请求格式有误：${issues.length} 项问题，未写入任何内容`, issues);
+  }
+  return edits;
+}
+
+/**
+ * 批量校订预览（只读，不推进版本）：
+ * POST /api/documents/:id/batch-edit/preview  { edits }
+ * 返回各行新文字（含每项编辑落位）、片段新位置、受影响组（区分新标 / 原已待修复），
+ * 以及提交须原样带回的 basis 与当前文献版本号。
+ * 非法区间 / 跨文献行 / 同行冲突 → 400 逐条定位；文献不存在 → 404。
+ */
+router.post(
+  '/documents/:id/batch-edit/preview',
+  wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const edits = parseBatchEdits(req.body);
+    const result = await withTx(async (c) => {
+      const doc = await getDoc(c, id);
+      const { plan } = await buildBatchEditPlan(c, doc, edits, false);
+      return { ...plan, documentId: doc.id, version: doc.version, editCount: edits.length };
+    });
+    res.json(result);
+  })
+);
+
+/**
+ * 确认整批写入：
+ * POST /api/documents/:id/batch-edit  { expectedVersion, edits, basis }
+ * 同一行的编辑按原坐标同时生效；版本过期 → 409 整批拒绝不写入；
+ * 预览所依据的行已变化（basis 不符，含删除 / 改抄本归属）→ 409 BATCH_EDIT_STALE；
+ * 非法区间 / 跨文献行 / 冲突编辑 → 400 逐条定位。成功仅推进一次文献版本，已发布快照保持原样。
+ */
+router.post(
+  '/documents/:id/batch-edit',
+  wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const edits = parseBatchEdits(req.body);
+    const result = await withTx(async (c) => {
+      const doc = await lockDoc(c, id);
+      checkVersion(doc, req.body?.expectedVersion); // 版本过期 → 409，不写入
+      // 先核对预览所依据的行（对照当前库），行已变化 → 409 BATCH_EDIT_STALE；再做区间/冲突语义校验
+      await verifyBasisCurrent(c, doc, req.body?.basis, [...new Set(edits.map((e) => e.lineId))]);
+      const { plan } = await buildBatchEditPlan(c, doc, edits, true);
+      await applyBatchEditPlan(c, plan);
+      await bumpVersion(c, id); // 整批成功只推进一次
+      const after = await getDoc(c, id);
+      return { version: after.version, result: { ...plan, documentId: id, editCount: edits.length } };
+    });
+    res.json({ ok: true, ...result });
   })
 );
 

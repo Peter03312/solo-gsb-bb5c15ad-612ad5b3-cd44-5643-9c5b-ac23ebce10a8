@@ -216,6 +216,79 @@ curl -X POST http://localhost:4000/api/documents/1/reline \
 `brokenGroups[]`（`groupId/ord/newlyBroken/reason`）。
 提交成功返回 `{ ok, version, result }`（`result` 与预览同构，新行 id 已回填）。
 
+### 批量校订（一次校订同一文献多份抄本的多条原始行）
+校勘人员可把同一文献**多份抄本、多条原始行**的改动合并为一批：先预览，再凭文献版本号确认整批写入。
+
+- **入参**：`edits[]`（**非空**），每项 `{ lineId, startCp, endCp, replacement }`；
+  区间一律按**改前原文**的 Unicode 码点左闭右开 `[startCp, endCp)` 给出，
+  `startCp === endCp` 为**纯插入**（`replacement` 可为空串表示删除）。
+  同一行可有多项编辑，它们按**原坐标同时生效**（不按顺序链式应用）。
+- **预览（只读，不推进版本）**：返回
+  - `lines[]`：每个受影响行的新文字（`oldContent/newContent/oldLengthCp/newLengthCp`）与该行
+    每项编辑的落位（`kind=replace|insert`、原区间、`resultStartCp/resultEndCp`、净位移 `deltaCp`）；
+  - `fragments[]`：受影响行上现存片段的新位置与状态
+    （`unchanged` 原位 / `shifted` 按累计位移平移 / `broken` 保留原坐标待修复，含所属组、行号、新旧区间、`note`）；
+  - `affectedGroups[]`：受影响组，`newlyBroken=true` 为新标待修复，`false` 为原已待修复、本次保持；
+  - `basis[]`：提交时须**原样带回**的各行改前状态；以及当前文献 `version`、`editCount`。
+- **冲突整批拒绝（400，逐条 `details[]` 定位，不写入）**：
+  - 区间非法（`startCp<0`、`endCp<startCp`、超出该行当前字数）→ `OUT_OF_RANGE`（带行号 / 区间）；
+  - 引用的行不存在 → `LINE_NOT_FOUND`；行不属于本文献抄本（跨文献行）→ `LINE_NOT_IN_DOC`；
+  - 同行两个**非插入**区间重叠（端点相接允许）→ `EDIT_OVERLAP`；
+  - 同行**同点重复插入** → `SAME_POINT_INSERTION`；
+  - 插入点**严格落在**其他编辑区间**内部** → `INSERT_INSIDE_EDIT`；
+  - 插入点落在其他编辑区间**端点**（起点或终点，语义不明）→ `INSERT_AT_EDIT_ENDPOINT`。
+  - 多个问题会一次性返回（含数组下标 `index` 与冲突对方 `otherIndex`）。
+- **片段与待修复规则**：
+  - 片段与**非插入**编辑区间相交、或**插入点严格位于片段内部** → 该片段 `broken`（保留原坐标待人工修复），
+    所在组待修复；
+  - 插入点位于片段**边界**（恰为片段起点 / 终点）**只平移后续片段，不标待修复**；
+  - 与编辑不相交的片段按其**前方编辑的累计位移**整体平移；平移后越界（缩行）同样待修复；
+  - **已待修复组不得自动转为完好**，**缺文标记不依附行、本操作绝不变更**；
+  - 跨点产生待修复组时，修复前不得发布新版；**已发布快照保持原样**。
+- **确认**：`POST …/batch-edit`，携带 `expectedVersion`、与预览相同的 `edits` 以及预览返回的 `basis`。
+  - 版本过期（`expectedVersion` ≠ 当前版本）→ **409**，整批拒绝、不写入；
+  - 预览所依据的行已变化（内容 / 行号 / 抄本归属变化、行删除、basis 行集合不符）
+    → **409** `details.code=BATCH_EDIT_STALE`（在区间 / 冲突语义校验**之前**核对，故行已变化时一律报过期）；
+  - 缺 `basis` 或其形状错误 → **400**；
+  - **成功只推进一次文献版本**，响应 `{ ok, version, result }`（`result` 与预览同构）。
+
+接口：
+
+```bash
+# 预览（只读，不推进版本）：可跨多份抄本、多条行
+curl -X POST http://localhost:4000/api/documents/1/batch-edit/preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "edits": [
+      { "lineId": 10, "startCp": 1, "endCp": 2, "replacement": "令" },
+      { "lineId": 10, "startCp": 10, "endCp": 10, "replacement": "也" },
+      { "lineId": 15, "startCp": 0, "endCp": 0, "replacement": "初" },
+      { "lineId": 16, "startCp": 2, "endCp": 2, "replacement": "·" }
+    ]
+  }'
+
+# 确认整批写入（携带预览响应里的 version 与 basis）
+curl -X POST http://localhost:4000/api/documents/1/batch-edit \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "expectedVersion": 7,
+    "edits": [
+      { "lineId": 10, "startCp": 1, "endCp": 2, "replacement": "令" },
+      { "lineId": 10, "startCp": 10, "endCp": 10, "replacement": "也" },
+      { "lineId": 15, "startCp": 0, "endCp": 0, "replacement": "初" },
+      { "lineId": 16, "startCp": 2, "endCp": 2, "replacement": "·" }
+    ],
+    "basis": [
+      { "lineId": 10, "msId": 2, "lineNo": 1, "content": "天命之謂性率性之謂道", "lengthCp": 10 }
+    ]
+  }'
+```
+
+预览返回：`documentId/version/editCount`、`lines[]`（`lineId/msId/msName/lineNo/oldContent/newContent/oldLengthCp/newLengthCp/edits[]`）、
+`fragments[]`（`fragmentId/groupId/groupOrd/groupAlreadyBroken/msId/msName/lineId/lineNo`、原区间、`status`、新区间、`note`）、
+`affectedGroups[]`（`groupId/ord/newlyBroken/reason`）、`basis[]`。
+确认成功返回 `{ ok, version, result }`（`result` 与预览同构）。
+
 ### 发布与旧版
 - 发布生成 **不可变快照**（JSONB，固化发布定稿时的版本号）。发布后继续修改只影响工作版，
   **旧发布版始终可阅读**（“发布与旧版”页签 → 阅读此版）。
@@ -313,6 +386,8 @@ curl -X POST http://localhost:4000/api/documents/1/editions/1/restore \
 | PUT | `/api/documents/:id/base` | 选定底本 |
 | POST | `/api/manuscripts/:msId/lines` | 追加一行 |
 | PUT | `/api/lines/:lineId` | 行内改字（`startCp/endCp/replacement`） |
+| POST | `/api/documents/:id/batch-edit/preview` | **批量校订预览**（只读）：多抄本多行非空 `edits[]`，返回各行新文字/编辑落位/片段新位置/受影响组/basis |
+| POST | `/api/documents/:id/batch-edit` | **确认批量校订**（同行按原坐标同时生效；区间重叠/同点插入/插入点落入他编辑区间及端点 400；版本过期或 basis 不符 409 整批拒绝不写入；成功只推进一次） |
 | PUT | `/api/documents/:id/groups` | 整批保存对应组（替换式，全量校验） |
 | PUT | `/api/documents/:id/groups/:gid/repair` | 修复单个对应组 |
 | DELETE | `/api/documents/:id/groups/:gid` | 删除对应组 |
@@ -359,7 +434,15 @@ npm test
 标题与已发布版编号及全部快照不变、重建行与组取得新 id 而抄本沿用稳定身份、
 恢复后与该版对照完全一致、恢复后改字/修复/行界/补配/对照/再发布/新增抄本全流程可用、
 成功版本号只前进一次、缺 expectedVersion 400、版本已变化 409 不改动、目标版不存在 404、
-损坏快照（片段越界）409 RESTORE_SNAPSHOT_INVALID 逐条说明且整体拒绝不推进版本**。
+损坏快照（片段越界）409 RESTORE_SNAPSHOT_INVALID 逐条说明且整体拒绝不推进版本**，以及
+**批量校订：多抄本多行非空 edits 同批预览（各行新文字/编辑落位/片段新位置/受影响组/basis）、
+同行编辑按原坐标同时生效且不链式、替换区间重叠（端点相接允许）/同点重复插入/插入点落入他编辑区间内部及端点
+整批 400 逐条定位（含下标与对方下标、多问题一并返回）、非法区间越界/跨文献行/不存在行 400、
+插入点严格位于片段内部令组待修复而位于边界仅平移、与替换区间相交片段保留原坐标待修复、
+不相交片段按累计位移平移、已待修复组不自动转好、缺文标记不变、扩展 B 区生僻字按码点计、
+预览只读不推进、缺 basis 400、basis 形状错 400、basis 行集合不符 400/409、
+版本过期 409 与 basis 不符 409（BATCH_EDIT_STALE，先于区间/冲突校验）皆整批拒绝不写入、
+成功只推进一次版本、已发布快照保持原样**。
 
 ---
 
@@ -371,7 +454,7 @@ npm test
 ├── docker-compose.yml        # 一键：db(PostgreSQL 16) + app
 ├── db/schema.sql             # 数据库结构（幂等，可重复执行）
 ├── server/                   # Node.js + TypeScript + Express
-│   └── src/ (db/validate/collation/diff/supplement/reline/restore/routes/repo/...)
+│   └── src/ (db/validate/collation/diff/supplement/reline/restore/batch-edit/routes/repo/...)
 └── web/                      # React 18 + Vite + TypeScript
     └── src/ (录文 / 归组 / 对照 / 发布与旧版 / 版本对照)
 ```

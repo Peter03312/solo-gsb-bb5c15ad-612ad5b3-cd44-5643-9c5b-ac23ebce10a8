@@ -9,6 +9,7 @@ const validate_1 = require("./validate");
 const supplement_1 = require("./supplement");
 const reline_1 = require("./reline");
 const restore_1 = require("./restore");
+const batch_edit_1 = require("./batch-edit");
 const util_1 = require("./util");
 const repo_1 = require("./repo");
 exports.router = (0, express_1.Router)();
@@ -171,6 +172,91 @@ exports.router.put('/lines/:lineId', wrap(async (req, res) => {
         await (0, repo_1.bumpVersion)(c, doc.id);
     });
     res.json({ ok: true });
+}));
+// ---------- 批量改字（一次校订同一文献多份抄本的多条原始行） ----------
+/**
+ * 解析批量编辑请求体的形状（不含内容相关校验）：
+ * 需要非空 edits[]，每项含整数 lineId/startCp/endCp 与字符串 replacement，
+ * 且 0 ≤ startCp ≤ endCp。任何形状问题 → 400 逐条（含数组下标）定位。
+ */
+function parseBatchEdits(body) {
+    const raw = body?.edits;
+    if (!Array.isArray(raw) || raw.length === 0) {
+        throw new util_1.HttpError(400, '需要非空 edits 数组（每项含 lineId/startCp/endCp/replacement）');
+    }
+    const issues = [];
+    const edits = [];
+    raw.forEach((e, i) => {
+        if (!e || typeof e !== 'object' ||
+            !(0, util_1.isInt)(e.lineId) ||
+            !(0, util_1.isInt)(e.startCp) ||
+            !(0, util_1.isInt)(e.endCp) ||
+            typeof e.replacement !== 'string') {
+            issues.push({ index: i, message: `第 ${i + 1} 项需含整数 lineId/startCp/endCp 与字符串 replacement` });
+            return;
+        }
+        const x = e;
+        if (x.lineId <= 0) {
+            issues.push({ index: i, message: `第 ${i + 1} 项 lineId 必须是正整数` });
+            return;
+        }
+        if (x.startCp < 0 || x.endCp < x.startCp) {
+            issues.push({
+                index: i,
+                lineId: x.lineId,
+                startCp: x.startCp,
+                endCp: x.endCp,
+                message: `第 ${i + 1} 项区间非法：[${x.startCp}, ${x.endCp})` +
+                    '（按 Unicode 码点左闭右开，需 0 ≤ startCp ≤ endCp；startCp=endCp 为纯插入）',
+            });
+            return;
+        }
+        edits.push({ lineId: x.lineId, startCp: x.startCp, endCp: x.endCp, replacement: x.replacement });
+    });
+    if (issues.length > 0) {
+        throw new util_1.HttpError(400, `批量校订请求格式有误：${issues.length} 项问题，未写入任何内容`, issues);
+    }
+    return edits;
+}
+/**
+ * 批量校订预览（只读，不推进版本）：
+ * POST /api/documents/:id/batch-edit/preview  { edits }
+ * 返回各行新文字（含每项编辑落位）、片段新位置、受影响组（区分新标 / 原已待修复），
+ * 以及提交须原样带回的 basis 与当前文献版本号。
+ * 非法区间 / 跨文献行 / 同行冲突 → 400 逐条定位；文献不存在 → 404。
+ */
+exports.router.post('/documents/:id/batch-edit/preview', wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const edits = parseBatchEdits(req.body);
+    const result = await (0, db_1.withTx)(async (c) => {
+        const doc = await (0, repo_1.getDoc)(c, id);
+        const { plan } = await (0, batch_edit_1.buildBatchEditPlan)(c, doc, edits, false);
+        return { ...plan, documentId: doc.id, version: doc.version, editCount: edits.length };
+    });
+    res.json(result);
+}));
+/**
+ * 确认整批写入：
+ * POST /api/documents/:id/batch-edit  { expectedVersion, edits, basis }
+ * 同一行的编辑按原坐标同时生效；版本过期 → 409 整批拒绝不写入；
+ * 预览所依据的行已变化（basis 不符，含删除 / 改抄本归属）→ 409 BATCH_EDIT_STALE；
+ * 非法区间 / 跨文献行 / 冲突编辑 → 400 逐条定位。成功仅推进一次文献版本，已发布快照保持原样。
+ */
+exports.router.post('/documents/:id/batch-edit', wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const edits = parseBatchEdits(req.body);
+    const result = await (0, db_1.withTx)(async (c) => {
+        const doc = await (0, repo_1.lockDoc)(c, id);
+        (0, repo_1.checkVersion)(doc, req.body?.expectedVersion); // 版本过期 → 409，不写入
+        // 先核对预览所依据的行（对照当前库），行已变化 → 409 BATCH_EDIT_STALE；再做区间/冲突语义校验
+        await (0, batch_edit_1.verifyBasisCurrent)(c, doc, req.body?.basis, [...new Set(edits.map((e) => e.lineId))]);
+        const { plan } = await (0, batch_edit_1.buildBatchEditPlan)(c, doc, edits, true);
+        await (0, batch_edit_1.applyBatchEditPlan)(c, plan);
+        await (0, repo_1.bumpVersion)(c, id); // 整批成功只推进一次
+        const after = await (0, repo_1.getDoc)(c, id);
+        return { version: after.version, result: { ...plan, documentId: id, editCount: edits.length } };
+    });
+    res.json({ ok: true, ...result });
 }));
 // ---------- 对应组 ----------
 /** 整批保存（替换）某文献全部对应组；任一校验失败整体拒绝。 */

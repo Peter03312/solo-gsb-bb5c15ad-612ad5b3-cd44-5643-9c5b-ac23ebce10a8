@@ -93,6 +93,114 @@ export interface EditionRow {
   created_at: string;
 }
 
+// ---- 批量改字（一次校订同一文献多份抄本的多条原始行）----
+
+/**
+ * 一条行内编辑：按“改前原文”的 Unicode 码点左闭右开区间 [startCp, endCp)
+ * 替换为 replacement；startCp === endCp 为纯插入。
+ * 同一行内的所有编辑一律按原坐标同时生效（不链式）。
+ */
+export interface BatchEditDTO {
+  lineId: number;
+  startCp: number;
+  endCp: number;
+  replacement: string;
+}
+
+/**
+ * 预览所依据的行状态：提交时须原样带回（提交只重发编辑列表 + basis）。
+ * 若预览后这些行已变化（内容 / 行号 / 抄本归属 / 删除），整批拒绝（409 BATCH_EDIT_STALE）。
+ */
+export interface BatchEditLineBasis {
+  lineId: number;
+  msId: number;
+  lineNo: number;
+  content: string;
+  lengthCp: number;
+}
+
+export type BatchEditKind = 'replace' | 'insert';
+
+/** 编辑预览：该编辑本身的改前/改后定位。 */
+export interface BatchEditPlanItem {
+  /** 在请求 edits 中的下标（错误定位用）。 */
+  index: number;
+  lineId: number;
+  msId: number;
+  msName: string;
+  lineNo: number;
+  kind: BatchEditKind;
+  startCp: number;
+  endCp: number;
+  replacement: string;
+  /** 替换文字码点数（插入即插入长度）。 */
+  replacementLengthCp: number;
+  /** 该行净增码点数 = replacement 码点数 - (endCp-startCp)。 */
+  deltaCp: number;
+  /** 该编辑在该行新文字中落定后的区间（左闭右开；纯插入为同点 [p,p)）。 */
+  resultStartCp: number;
+  resultEndCp: number;
+}
+
+/** 该批涉及行的新文字预览。 */
+export interface BatchEditLinePlan {
+  lineId: number;
+  msId: number;
+  msName: string;
+  lineNo: number;
+  oldContent: string;
+  newContent: string;
+  oldLengthCp: number;
+  newLengthCp: number;
+  edits: BatchEditPlanItem[];
+}
+
+export type BatchFragmentStatus = 'unchanged' | 'shifted' | 'broken';
+
+/** 现存片段在整批同时生效后的新位置 / 状态（只列出受影响行上的真实片段）。 */
+export interface BatchEditFragmentPlan {
+  fragmentId: number;
+  groupId: number;
+  groupOrd: number;
+  groupAlreadyBroken: boolean; // 组当前是否已待修复（绝不由本次改动自动转好）
+  msId: number;
+  msName: string;
+  lineId: number;
+  lineNo: number;
+  oldStartCp: number;
+  oldEndCp: number;
+  status: BatchFragmentStatus;
+  /** shifted/unchanged 时给出；broken 时为 null（保留原坐标待人工修复）。 */
+  newLineId: number | null;
+  newStartCp: number | null;
+  newEndCp: number | null;
+  note: string;
+}
+
+export interface BatchEditAffectedGroup {
+  groupId: number;
+  ord: number;
+  newlyBroken: boolean; // false=原已待修复，本次保持（不自动转完好）
+  reason: string;
+}
+
+export interface BatchEditPlan {
+  /** 受影响行的新文字（含每行编辑落位）。 */
+  lines: BatchEditLinePlan[];
+  /** 受影响行上的现存片段新位置。 */
+  fragments: BatchEditFragmentPlan[];
+  /** 受影响组（相交 / 内部插入 / 迁移越界）；含原已待修复组。 */
+  affectedGroups: BatchEditAffectedGroup[];
+  /** 提交须原样带回。 */
+  basis: BatchEditLineBasis[];
+}
+
+export interface BatchEditPreview extends BatchEditPlan {
+  documentId: number;
+  version: number;
+  editCount: number;
+}
+
 // ---- 行界调整（拆分 / 合并原始行，不改变字序）----
 
 export type ReLineOp = 'split' | 'merge';
